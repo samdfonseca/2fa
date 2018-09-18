@@ -106,7 +106,9 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 
-	k := readKeychain(filepath.Join(os.Getenv("HOME"), ".2fa"))
+	file := filepath.Join(os.Getenv("HOME"), ".2fa")
+	data := readKeychainFile(file)
+	k := newKeychain(file, data)
 
 	if *flagList {
 		if flag.NArg() != 0 {
@@ -143,6 +145,8 @@ type Keychain struct {
 	file string
 	data []byte
 	keys map[string]Key
+	Hotp func([]byte, uint64, int) int
+	Totp func([]byte, time.Time, int) int
 }
 
 type Key struct {
@@ -153,27 +157,41 @@ type Key struct {
 
 const counterLen = 20
 
-func readKeychain(file string) *Keychain {
-	c := &Keychain{
-		file: file,
-		keys: make(map[string]Key),
-	}
-	data, err := ioutil.ReadFile(file)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return c
-		}
-		log.Fatal(err)
-	}
-	c.data = data
+var (
+	newlineBytes = []byte{byte('\n')}
+	spaceBytes   = []byte(" ")
+)
 
-	lines := bytes.SplitAfter(data, []byte("\n"))
+func readKeychainFile(file string) []byte {
+	var fileContents []byte
+	fileContents, err := ioutil.ReadFile(file)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Fatal(err)
+		}
+	}
+	return fileContents
+}
+
+// Trim off trailing newline and space characters recursively, then split by space characters
+func parseKeychainKeyLine(line []byte) [][]byte {
+	trimmed := bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte(" "))
+	if bytes.Equal(line, trimmed) {
+		return bytes.Split(line, []byte(" "))
+	}
+	return parseKeychainKeyLine(trimmed)
+}
+
+func parseKeychainKeys(linesUnsplit []byte) map[string]Key {
+	keys := make(map[string]Key)
 	offset := 0
-	for i, line := range lines {
+	lines := bytes.SplitAfter(linesUnsplit, newlineBytes)
+	for i := range lines {
 		lineno := i + 1
-		offset += len(line)
-		f := bytes.Split(bytes.TrimSuffix(line, []byte("\n")), []byte(" "))
+		offset += len(lines[i])
+		f := parseKeychainKeyLine(lines[i])
 		if len(f) == 1 && len(f[0]) == 0 {
+			// skip empty lines
 			continue
 		}
 		if len(f) >= 3 && len(f[1]) == 1 && '6' <= f[1][0] && f[1][0] <= '8' {
@@ -181,28 +199,41 @@ func readKeychain(file string) *Keychain {
 			name := string(f[0])
 			k.digits = int(f[1][0] - '0')
 			raw, err := decodeKey(string(f[2]))
-			if err == nil {
-				k.raw = raw
-				if len(f) == 3 {
-					c.keys[name] = k
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+			k.raw = raw
+			if len(f) == 3 {
+				keys[name] = k
+			} else if len(f) == 4 && len(f[3]) == counterLen {
+				_, err := strconv.ParseUint(string(f[3]), 10, 64)
+				if err != nil {
 					continue
 				}
-				if len(f) == 4 && len(f[3]) == counterLen {
-					_, err := strconv.ParseUint(string(f[3]), 10, 64)
-					if err == nil {
-						// Valid counter.
-						k.offset = offset - counterLen
-						if line[len(line)-1] == '\n' {
-							k.offset--
-						}
-						c.keys[name] = k
-						continue
-					}
+				k.offset = offset - counterLen
+				if lines[i][len(lines[i])-1] == '\n' {
+					k.offset--
 				}
+				keys[name] = k
 			}
+			continue
 		}
-		log.Printf("%s:%d: malformed key", c.file, lineno)
+		log.Printf("L#%d: malformed key", lineno)
 	}
+	return keys
+}
+
+func newKeychain(file string, data []byte) *Keychain {
+	c := &Keychain{
+		file: file,
+		keys: make(map[string]Key),
+		Hotp: hotp,
+		Totp: totp,
+	}
+	c.data = data
+	c.keys = parseKeychainKeys(c.data)
+
 	return c
 }
 
@@ -278,7 +309,7 @@ func (c *Keychain) code(name string) string {
 			log.Fatalf("malformed key counter for %q (%q)", name, c.data[k.offset:k.offset+counterLen])
 		}
 		n++
-		code = hotp(k.raw, n, k.digits)
+		code = c.Hotp(k.raw, n, k.digits)
 		f, err := os.OpenFile(c.file, os.O_RDWR, 0600)
 		if err != nil {
 			log.Fatalf("opening keychain: %v", err)
@@ -291,7 +322,7 @@ func (c *Keychain) code(name string) string {
 		}
 	} else {
 		// Time-based key.
-		code = totp(k.raw, time.Now(), k.digits)
+		code = c.Totp(k.raw, time.Now(), k.digits)
 	}
 	return fmt.Sprintf("%0*d", k.digits, code)
 }
